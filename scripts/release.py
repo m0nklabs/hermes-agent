@@ -30,6 +30,8 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from co_author_utils import co_author_trailer
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
@@ -1845,9 +1847,8 @@ def main():
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
                 return
 
-            commit_result = git_result(
-                "commit", "-m", f"chore: bump version to v{new_version} ({calver_date})"
-            )
+            commit_msg = f"chore: bump version to v{new_version} ({calver_date})\n\n{co_author_trailer('Release Manager')}"
+            commit_result = git_result("commit", "-m", commit_msg)
             if commit_result.returncode != 0:
                 print(f"  ✗ Failed to commit version bump: {commit_result.stderr.strip()}")
                 return
