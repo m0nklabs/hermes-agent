@@ -1090,15 +1090,39 @@ def build_aider_invocation(
     raise ValueError(f"Unsupported Aider role: {role}")
 
 
+def _load_researcher_prompt() -> str:
+    """Load the iron-strong researcher system prompt."""
+    prompt_path = Path.home() / ".hermes" / "prompts" / "aider" / "researcher.md"
+    if not prompt_path.exists():
+        # Minimal fallback
+        return (
+            "You are the Aider Researcher. Analyze the issue, understand the codebase, "
+            "and create a detailed implementation plan with specific files to modify, "
+            "edge cases to consider, and test coverage needed."
+        )
+    return prompt_path.read_text(encoding="utf-8")
+
+
 def _local_coder_prompt(repo: str, issue: IssueMetadata, branch: str) -> str:
+    # Load iron-strong researcher prompt
+    researcher_prompt = _load_researcher_prompt()
+    
+    # Build task context
     return (
-        f"Create a new branch for Issue #{issue.number}, write the code to fix the issue, "
-        "and push the branch to GitHub.\n\n"
+        "=" * 60 + "\n"
+        "IRON-STRONG RESEARCHER SYSTEM PROMPT\n"
+        "=" * 60 + "\n"
+        + researcher_prompt + "\n\n"
+        "=" * 60 + "\n"
+        "TASK CONTEXT\n"
+        "=" * 60 + "\n"
+        f"Analyze and create an implementation plan for Issue #{issue.number}.\n\n"
         f"Repository: {repo}\n"
-        f"Branch: {branch}\n"
+        f"Branch to create: {branch}\n"
         f"Issue URL: {issue.url}\n"
         f"Issue title: {issue.title}\n\n"
-        f"Issue body:\n{issue.body or '(empty)'}\n"
+        f"Issue body:\n{issue.body or '(empty)'}\n\n"
+        "Follow the researcher system prompt to produce a detailed, structured plan.\n"
     )
 
 

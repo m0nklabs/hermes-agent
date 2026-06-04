@@ -6822,6 +6822,27 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    # HERMES_MODEL — the model the worker will use. Resolved from task
+    # model_override, or fall back to the parent env, or profile config.
+    # Workers use this to include accurate model info in Co-Authored-By
+    # commit trailers for agent traceability.
+    if task.model_override:
+        env["HERMES_MODEL"] = task.model_override
+    elif not env.get("HERMES_MODEL"):
+        try:
+            from hermes_cli.config import load_config as _load_config
+            cfg = _load_config()
+            model_cfg = cfg.get("model", {})
+            if isinstance(model_cfg, dict):
+                default_model = model_cfg.get("default", "")
+            elif isinstance(model_cfg, str):
+                default_model = model_cfg
+            else:
+                default_model = ""
+            if default_model:
+                env["HERMES_MODEL"] = str(default_model)
+        except Exception:
+            pass
 
     cmd = [
         *_resolve_hermes_argv(),

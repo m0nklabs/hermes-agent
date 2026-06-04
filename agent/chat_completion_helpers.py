@@ -35,8 +35,43 @@ from agent.message_sanitization import (
 )
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+def _is_local_guardian_stream_route(agent: Any) -> bool:
+    """Return True for the local Guardian OpenAI-compatible streaming route.
+
+    This path needs special handling because Guardian emits SSE comment
+    keepalives that the high-level OpenAI SDK stream iterator does not
+    surface as chunk objects.
+    """
+    base_url = str(getattr(agent, "base_url", "") or "").strip()
+    if not base_url or not is_local_endpoint(base_url):
+        return False
+
+    parsed = urlparse(base_url)
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if provider != "custom":
+        return False
+
+    if parsed.port not in {None, 11434}:
+        return False
+
+    return parsed.path.rstrip("/").endswith("/v1")
+
+
+def _default_stream_retry_count(agent: Any) -> int:
+    """Return the default streaming retry budget for the active route."""
+    raw = os.getenv("HERMES_STREAM_RETRIES")
+    if raw is not None:
+        return int(raw)
+    # Guardian is single-slot locally; immediate inner retries can queue
+    # behind the still-running original stream and produce avoidable 429 noise.
+    if _is_local_guardian_stream_route(agent):
+        return 0
+    return 2
 
 
 def _ra():
