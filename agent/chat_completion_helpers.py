@@ -1658,10 +1658,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
     first_delta_fired = {"done": False}
     deltas_were_sent = {"yes": False}  # Track if any deltas were fired (for fallback)
-    # Wall-clock timestamp of the last real streaming chunk.  The outer
-    # poll loop uses this to detect stale connections that keep receiving
-    # SSE keep-alive pings but no actual data.
-    last_chunk_time = {"t": time.time()}
+    # Wall-clock timestamp of the last real stream data observed by Hermes.
+    # Transport keepalive comments keep sockets open, but they do not prove
+    # the model is still making progress.
+    last_stream_activity_time = {"t": time.time()}
+    # Absolute stream start time. Keepalive comments can keep a connection
+    # looking alive forever on shared single-slot endpoints, so the provider
+    # request timeout still needs to act as a hard wall-clock cap.
+    stream_started_at = {"t": last_stream_activity_time["t"]}
+    stream_total_timeout = {"seconds": float("inf")}
 
     def _fire_first_delta():
         if not first_delta_fired["done"] and on_first_delta:
@@ -1674,6 +1679,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _call_chat_completions():
         """Stream a chat completions response."""
         import httpx as _httpx
+        _use_local_guardian_raw_stream = _is_local_guardian_stream_route(agent)
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
         _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
@@ -1681,6 +1687,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _provider_timeout_cfg
             if _provider_timeout_cfg is not None
             else float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+        )
+        stream_total_timeout["seconds"] = (
+            _base_timeout if _base_timeout > 0 else float("inf")
         )
         # Read timeout: config wins here too.  Otherwise use
         # HERMES_STREAM_READ_TIMEOUT (default 120s) for cloud providers.
@@ -1720,26 +1729,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         )
         # Reset stale-stream timer so the detector measures from this
         # attempt's start, not a previous attempt's last chunk.
-        last_chunk_time["t"] = time.time()
+        last_stream_activity_time["t"] = time.time()
+        stream_started_at["t"] = last_stream_activity_time["t"]
         agent._touch_activity("waiting for provider response (streaming)")
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
-        stream = request_client.chat.completions.create(**stream_kwargs)
-
-        # Capture rate limit headers from the initial HTTP response.
-        # The OpenAI SDK Stream object exposes the underlying httpx
-        # response via .response before any chunks are consumed.
-        agent._capture_rate_limits(getattr(stream, "response", None))
-        # Snapshot diagnostic headers (cf-ray, x-openrouter-provider, etc.)
-        # so they survive even when the stream dies before any chunk
-        # arrives.  Best-effort; never raises.
-        agent._stream_diag_capture_response(_diag, getattr(stream, "response", None))
-
-        # Log OpenRouter response cache status when present.
-        agent._check_openrouter_cache_status(getattr(stream, "response", None))
 
         content_parts: list = []
         tool_calls_acc: dict = {}
@@ -1755,8 +1752,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
-        for chunk in stream:
-            last_chunk_time["t"] = time.time()
+        def _process_stream_chunk(chunk: Any) -> bool:
+            nonlocal finish_reason, model_name, usage_obj
+
+            last_stream_activity_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
 
             # Update per-attempt diagnostic counters.  Best-effort —
@@ -1765,7 +1764,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             try:
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
-                    _diag["first_chunk_at"] = last_chunk_time["t"]
+                    _diag["first_chunk_at"] = last_stream_activity_time["t"]
                 # Approximate byte size from the chunk's repr — exact wire
                 # bytes aren't exposed by the SDK, but len(repr(chunk)) is
                 # a stable proxy for "how much content arrived" that
@@ -1778,7 +1777,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 pass
 
             if agent._interrupt_requested:
-                break
+                return False
 
             if not chunk.choices:
                 if hasattr(chunk, "model") and chunk.model:
@@ -1786,7 +1785,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Usage comes in the final chunk with empty choices
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
-                continue
+                return True
 
             delta = chunk.choices[0].delta
             if hasattr(chunk, "model") and chunk.model:
@@ -1897,6 +1896,68 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if hasattr(chunk, "usage") and chunk.usage:
                 usage_obj = chunk.usage
 
+            return True
+
+        def _iter_local_guardian_stream_chunks():
+            """Yield parsed chunk objects while consuming Guardian keepalive comments.
+
+            Guardian emits SSE comment heartbeats during quiet periods.
+            The high-level SDK stream iterator ignores those comment lines,
+            so the local Guardian route uses the SDK's raw streaming-response
+            context and parses data lines manually.
+            """
+            from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
+
+            with request_client.chat.completions.with_streaming_response.create(**stream_kwargs) as response:
+                http_response = (
+                    getattr(response, "http_response", None)
+                    or getattr(response, "response", None)
+                )
+                agent._capture_rate_limits(http_response)
+                agent._stream_diag_capture_response(_diag, http_response)
+                agent._check_openrouter_cache_status(http_response)
+
+                for raw_line in response.iter_lines():
+                    if agent._interrupt_requested:
+                        break
+
+                    line = "" if raw_line is None else str(raw_line)
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        agent._touch_activity("receiving stream keepalive")
+                        continue
+                    if not line.startswith("data: "):
+                        continue
+
+                    payload = line[6:].strip()
+                    if not payload or payload == "[DONE]":
+                        continue
+
+                    last_stream_activity_time["t"] = time.time()
+                    yield ChatCompletionChunk.model_validate_json(payload)
+
+        if _use_local_guardian_raw_stream:
+            stream = _iter_local_guardian_stream_chunks()
+        else:
+            stream = request_client.chat.completions.create(**stream_kwargs)
+
+            # Capture rate limit headers from the initial HTTP response.
+            # The OpenAI SDK Stream object exposes the underlying httpx
+            # response via .response before any chunks are consumed.
+            agent._capture_rate_limits(getattr(stream, "response", None))
+            # Snapshot diagnostic headers (cf-ray, x-openrouter-provider, etc.)
+            # so they survive even when the stream dies before any chunk
+            # arrives.  Best-effort; never raises.
+            agent._stream_diag_capture_response(_diag, getattr(stream, "response", None))
+
+            # Log OpenRouter response cache status when present.
+            agent._check_openrouter_cache_status(getattr(stream, "response", None))
+
+        for chunk in stream:
+            if not _process_stream_chunk(chunk):
+                break
+
         # Build mock response matching non-streaming shape
         full_content = "".join(content_parts) or None
         mock_tool_calls = None
@@ -1969,7 +2030,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         has_tool_use = False
 
         # Reset stale-stream timer for this attempt
-        last_chunk_time["t"] = time.time()
+        last_stream_activity_time["t"] = time.time()
         # Per-attempt diagnostic dict for the retry block to consume.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
@@ -1992,14 +2053,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Opus streams after 180 s even when events are
                 # actively arriving (the chat_completions path
                 # already does this at the top of its chunk loop).
-                last_chunk_time["t"] = time.time()
+                last_stream_activity_time["t"] = time.time()
                 agent._touch_activity("receiving stream response")
 
                 # Update per-attempt diagnostic counters (best-effort).
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
-                        _diag["first_chunk_at"] = last_chunk_time["t"]
+                        _diag["first_chunk_at"] = last_stream_activity_time["t"]
                     try:
                         _diag["bytes"] = int(_diag.get("bytes", 0)) + len(repr(event))
                     except Exception:
@@ -2043,7 +2104,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _call():
         import httpx as _httpx
 
-        _max_stream_retries = int(os.getenv("HERMES_STREAM_RETRIES", 2))
+        _is_local_guardian_stream = _is_local_guardian_stream_route(agent)
+        _max_stream_retries = _default_stream_retry_count(agent)
+
+        def _maybe_backoff_local_guardian_retry(next_attempt: int) -> None:
+            if not _is_local_guardian_stream or _max_stream_retries <= 0:
+                return
+            delay = jittered_backoff(
+                next_attempt,
+                base_delay=2.0,
+                max_delay=15.0,
+                jitter_ratio=0.15,
+            )
+            logger.info(
+                "Local Guardian stream retry backoff %.2fs before attempt %s/%s",
+                delay,
+                next_attempt + 1,
+                _max_stream_retries + 1,
+            )
+            time.sleep(delay)
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
@@ -2138,6 +2217,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # about to be re-streamed.  Structured WARNING is
                         # emitted by ``_emit_stream_drop`` below; no
                         # additional INFO line needed.
+                        _maybe_backoff_local_guardian_retry(_stream_attempt + 1)
                         try:
                             agent._fire_stream_delta(
                                 "\n\n⚠ Connection dropped mid tool-call; "
@@ -2209,6 +2289,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # Transient network / timeout error. Retry the
                         # streaming request with a fresh connection first.
                         if _stream_attempt < _max_stream_retries:
+                            _maybe_backoff_local_guardian_retry(_stream_attempt + 1)
                             agent._emit_stream_drop(
                                 error=e,
                                 attempt=_stream_attempt + 2,
@@ -2331,19 +2412,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _hb_now = time.time()
         if _hb_now - _last_heartbeat >= _HEARTBEAT_INTERVAL:
             _last_heartbeat = _hb_now
-            _waiting_secs = int(_hb_now - last_chunk_time["t"])
+            _waiting_secs = int(_hb_now - last_stream_activity_time["t"])
             agent._touch_activity(
-                f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
+                f"waiting for stream response ({_waiting_secs}s since last stream activity)"
             )
 
         # Detect stale streams: connections kept alive by SSE pings
         # but delivering no real chunks.  Kill the client so the
         # inner retry loop can start a fresh connection.
-        _stale_elapsed = time.time() - last_chunk_time["t"]
+        _stale_elapsed = time.time() - last_stream_activity_time["t"]
         if _stale_elapsed > _stream_stale_timeout:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
-                "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
+                "Stream stale for %.0fs (threshold %.0fs) — no stream activity received. "
                 "model=%s context=~%s tokens. Killing connection.",
                 _stale_elapsed, _stream_stale_timeout,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
@@ -2366,9 +2447,36 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 pass
             # Reset the timer so we don't kill repeatedly while
             # the inner thread processes the closure.
-            last_chunk_time["t"] = time.time()
+            last_stream_activity_time["t"] = time.time()
             agent._touch_activity(
                 f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
+            )
+
+        _total_elapsed = time.time() - stream_started_at["t"]
+        if _total_elapsed > stream_total_timeout["seconds"]:
+            _est_ctx = estimate_request_context_tokens(api_kwargs)
+            logger.warning(
+                "Stream open for %.0fs (request timeout %.0fs) — aborting stream. "
+                "model=%s context=~%s tokens.",
+                _total_elapsed,
+                stream_total_timeout["seconds"],
+                api_kwargs.get("model", "unknown"),
+                f"{_est_ctx:,}",
+            )
+            agent._emit_status(
+                f"⚠️ Provider stream exceeded request timeout of "
+                f"{int(stream_total_timeout['seconds'])}s "
+                f"(model: {api_kwargs.get('model', 'unknown')}, "
+                f"context: ~{_est_ctx:,} tokens). Reconnecting..."
+            )
+            try:
+                _close_request_client_once("stream_wall_timeout_kill")
+            except Exception:
+                pass
+            stream_started_at["t"] = time.time()
+            last_stream_activity_time["t"] = stream_started_at["t"]
+            agent._touch_activity(
+                f"stream wall timeout reached after {int(_total_elapsed)}s, reconnecting"
             )
 
         if agent._interrupt_requested:

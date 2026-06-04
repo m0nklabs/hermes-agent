@@ -50,6 +50,18 @@ These two tools live in the `browser` toolset but only register when a Chrome De
 |------|-------------|----------------------|
 | `execute_code` | Run a Python script that can call Hermes tools programmatically. Use this when you need 3+ tool calls with processing logic between them, need to filter/reduce large tool outputs before they enter your context, need conditional branching (… | — |
 
+## `aider` toolset
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `aider_subagent` | Delegate code-writing work to a local Aider subprocess. Hermes stays the orchestrator and passes a self-contained instruction to `aider --message <instruction> --yes`; Aider performs the repository edits. The wrapper disables Aider auto-commits, prevents `.gitignore` edits, and stores transient history under `/tmp` so target repos stay clean. Optional `model`, `workdir`, `timeout_seconds`, and `env_file` parameters override the default model, target directory, subprocess timeout, and dotenv bridge. OpenRouter credentials are bridged from `~/.hermes/.env` by default for OpenRouter models. | `aider` on `PATH` or `AIDER_BIN`; OpenRouter token via `OPENROUTER_API_KEY` for OpenRouter models |
+
+## `pr_agent` toolset
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `pr_agent` | Run PR-Agent against a GitHub pull request for `ask`, `review`, `describe`, or `generate_labels` actions. Defaults to `publish_output=false` for dry-run triage and routes OpenRouter models through a minimal env bridge so Hermes' Guardian/OpenAI settings do not leak into PR-Agent. Use this before Aider: PR-Agent analyzes the PR, then `aider_subagent` handles code edits only when there is actionable work. | `pr-agent` on `PATH` or `PR_AGENT_BIN`; GitHub token via `GITHUB__USER_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth`; OpenRouter token via `OPENROUTER_API_KEY` for OpenRouter models |
+
 ## `cronjob` toolset
 
 | Tool | Description | Requires environment |

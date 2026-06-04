@@ -125,6 +125,14 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GATEWAY_MEDIA_TAG_RE = re.compile(
+    r'MEDIA:((?:/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
+    r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
+    r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
+    r'txt|csv|apk|ipa))',
+    re.IGNORECASE,
+)
+
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
@@ -227,6 +235,54 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
     return redacted
 
 
+def _extract_gateway_media_paths(text: str) -> list[str]:
+    """Return MEDIA paths embedded in gateway-visible text."""
+    if "MEDIA:" not in str(text or ""):
+        return []
+    paths: list[str] = []
+    for match in _GATEWAY_MEDIA_TAG_RE.finditer(str(text)):
+        path = match.group(1).strip().rstrip('",}')
+        if path:
+            paths.append(path)
+    return paths
+
+
+def _append_new_tool_media_tags(
+    final_response: str,
+    messages: list[dict],
+    history_media_paths: set[str],
+) -> str:
+    """Append new MEDIA tags from current-turn tool results without duplicates."""
+    if not final_response:
+        return final_response
+
+    existing_paths = set(_extract_gateway_media_paths(final_response))
+    seen_tags: set[str] = set()
+    media_tags: list[str] = []
+    has_voice_directive = "[[audio_as_voice]]" in final_response
+
+    for msg in messages or []:
+        if msg.get("role") not in {"tool", "function"}:
+            continue
+        content = str(msg.get("content", ""))
+        if "[[audio_as_voice]]" in content:
+            has_voice_directive = True
+        for path in _extract_gateway_media_paths(content):
+            if path in history_media_paths or path in existing_paths:
+                continue
+            tag = f"MEDIA:{path}"
+            if tag in seen_tags:
+                continue
+            seen_tags.add(tag)
+            media_tags.append(tag)
+
+    if not media_tags:
+        return final_response
+    if has_voice_directive and "[[audio_as_voice]]" not in final_response:
+        media_tags.insert(0, "[[audio_as_voice]]")
+    return final_response + "\n" + "\n".join(media_tags)
+
+
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
@@ -301,6 +357,25 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
+
+
+def _sanitize_gateway_reasoning_for_display(platform: Any, text: str) -> str:
+    """Sanitize optional reasoning text before it is prepended to chat replies."""
+    if not text:
+        return text
+    if _gateway_platform_value(platform) != "telegram":
+        return text
+
+    redacted = _redact_gateway_user_facing_secrets(str(text))
+    safe_lines: list[str] = []
+    for line in redacted.splitlines():
+        stripped = line.strip()
+        safe_lines.append(
+            _gateway_provider_error_reply(stripped)
+            if _looks_like_gateway_provider_error(stripped)
+            else line
+        )
+    return "\n".join(safe_lines)
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -2802,8 +2877,10 @@ class GatewayRunner:
 
     def _queue_during_drain_enabled(self) -> bool:
         # Both "queue" and "steer" modes imply the user doesn't want messages
-        # to be lost during restart — queue them for the newly-spawned gateway
-        # process to pick up.  "interrupt" mode drops them (current behaviour).
+        # to be lost during restart — queue them in the current process while
+        # the graceful drain is still running.  Durable post-restart recovery is
+        # handled by the session resume marker, not by this in-memory queue.
+        # "interrupt" mode drops them (current behaviour).
         return self._restart_requested and self._busy_input_mode in {"queue", "steer"}
 
     # -------- /queue FIFO helpers --------------------------------------
@@ -3364,7 +3441,10 @@ class GatewayRunner:
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                message = (
+                    f"⏳ Gateway {self._status_action_gerund()} — queued for the current drain window. "
+                    "If the process exits first, send it again after restart."
+                )
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
@@ -4734,6 +4814,19 @@ class GatewayRunner:
         # visible for manual recovery on the next user message.
         self._schedule_resume_pending_sessions()
 
+        try:
+            from gateway.issue_resolution import resume_issue_resolution_queue
+            resumed_issue_runs = await resume_issue_resolution_queue(
+                notify=self._notify_issue_resolution_home,
+            )
+            if resumed_issue_runs:
+                logger.info(
+                    "Issue-resolution queue resumed %d pending/interrupted run(s)",
+                    resumed_issue_runs,
+                )
+        except Exception as exc:
+            logger.warning("Issue-resolution queue resume failed: %s", exc)
+
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
             from tools.process_registry import process_registry
@@ -5251,6 +5344,38 @@ class GatewayRunner:
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
+        disabled_broken_boards: dict[str, tuple[str, int | None, int | None]] = {}
+
+        def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
+            path = _kb.kanban_db_path(slug)
+            try:
+                resolved = str(path.expanduser().resolve())
+            except Exception:
+                resolved = str(path)
+            try:
+                stat = path.stat()
+            except OSError:
+                return (resolved, None, None)
+            return (resolved, stat.st_mtime_ns, stat.st_size)
+
+        def _board_db_failure_kind(exc: Exception) -> Optional[str]:
+            if isinstance(exc, _kb.KanbanDbCorruptError):
+                return "invalid"
+            if not isinstance(exc, sqlite3.DatabaseError):
+                return None
+            msg = str(exc).lower()
+            if (
+                "file is not a database" in msg
+                or "database disk image is malformed" in msg
+            ):
+                return "invalid"
+            if (
+                "disk i/o error" in msg
+                or "readonly database" in msg
+                or "unable to open database file" in msg
+            ):
+                return "storage"
+            return None
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -5280,6 +5405,21 @@ class GatewayRunner:
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
                         db_path = board_meta.get("db_path")
+                        fingerprint = _board_db_fingerprint(slug)
+                        disabled_fingerprint = disabled_broken_boards.get(slug)
+                        if disabled_fingerprint == fingerprint:
+                            logger.debug(
+                                "kanban notifier: board %s disabled for DB fingerprint %s",
+                                slug,
+                                fingerprint[0],
+                            )
+                            continue
+                        if disabled_fingerprint is not None:
+                            logger.info(
+                                "kanban notifier: board %s database changed; retrying notifier",
+                                slug,
+                            )
+                            disabled_broken_boards.pop(slug, None)
                         try:
                             resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
                         except Exception:
@@ -5291,12 +5431,9 @@ class GatewayRunner:
                             )
                             continue
                         seen_db_paths.add(resolved_db_path)
+                        conn = None
                         try:
                             conn = _kb.connect(board=slug)
-                        except Exception as exc:
-                            logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
-                            continue
-                        try:
                             # `connect()` runs the schema + idempotent migration
                             # on first open per process, so an explicit
                             # `init_db()` here would be redundant. Worse:
@@ -5350,8 +5487,36 @@ class GatewayRunner:
                                     "task": task,
                                     "board": slug,
                                 })
+                        except (_kb.KanbanDbCorruptError, sqlite3.DatabaseError) as exc:
+                            failure_kind = _board_db_failure_kind(exc)
+                            if failure_kind == "invalid":
+                                disabled_broken_boards[slug] = fingerprint
+                                logger.error(
+                                    "kanban notifier: board %s database %s is corrupt or not "
+                                    "a valid SQLite database; disabling notifications for this "
+                                    "board until the file changes or the gateway restarts. Move "
+                                    "or restore the file, then run `hermes kanban init` if you "
+                                    "need a fresh board.",
+                                    slug,
+                                    fingerprint[0],
+                                )
+                                continue
+                            if failure_kind == "storage":
+                                disabled_broken_boards[slug] = fingerprint
+                                logger.error(
+                                    "kanban notifier: board %s database %s hit SQLite storage "
+                                    "error (%s); disabling notifications for this board until "
+                                    "the file changes or the gateway restarts.",
+                                    slug,
+                                    fingerprint[0],
+                                    exc,
+                                )
+                                continue
+                            logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
+                            continue
                         finally:
-                            conn.close()
+                            if conn is not None:
+                                conn.close()
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
@@ -5904,12 +6069,20 @@ class GatewayRunner:
             if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
                 return True
             if not isinstance(exc, sqlite3.DatabaseError):
-                return False
+                return None
             msg = str(exc).lower()
-            return (
+            if (
                 "file is not a database" in msg
                 or "database disk image is malformed" in msg
-            )
+            ):
+                return "invalid"
+            if (
+                "disk i/o error" in msg
+                or "readonly database" in msg
+                or "unable to open database file" in msg
+            ):
+                return "storage"
+            return None
 
         def _tick_once_for_board(slug: str) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
@@ -5973,6 +6146,17 @@ class GatewayRunner:
                         "then run `hermes kanban init` if you need a fresh board.",
                         slug,
                         fingerprint[0],
+                    )
+                    return None
+                if failure_kind == "storage":
+                    disabled_corrupt_boards[slug] = fingerprint
+                    logger.error(
+                        "kanban dispatcher: board %s database %s hit SQLite storage "
+                        "error (%s); disabling dispatch for this board until the "
+                        "file changes or the gateway restarts.",
+                        slug,
+                        fingerprint[0],
+                        exc,
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
@@ -6130,6 +6314,14 @@ class GatewayRunner:
                                     "kanban auto-decompose [%s]: %s → single task (no fanout)",
                                     slug, tid,
                                 )
+                        elif outcome.reason == _decomp.AUX_BUSY_REASON:
+                            logger.debug(
+                                "kanban auto-decompose [%s]: auxiliary provider busy on %s; "
+                                "deferring remaining triage tasks to the next tick",
+                                slug,
+                                tid,
+                            )
+                            return successes
                         else:
                             # Common no-op reasons (no aux client configured) shouldn't
                             # spam logs every tick. Log at debug.
@@ -7372,6 +7564,28 @@ class GatewayRunner:
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    async def _notify_issue_resolution_home(self, content: str) -> None:
+        """Deliver issue-resolution lifecycle notices to configured home channels."""
+        delivered = False
+        for platform, adapter in list(getattr(self, "adapters", {}) or {}).items():
+            try:
+                home = self.config.get_home_channel(platform)
+            except Exception:
+                home = None
+            if not home:
+                continue
+            try:
+                result = await adapter.send(home.chat_id, content)
+                delivered = delivered or bool(getattr(result, "success", False))
+            except Exception:
+                logger.debug(
+                    "issue-resolution home notice failed for %s",
+                    getattr(platform, "value", platform),
+                    exc_info=True,
+                )
+        if not delivered:
+            logger.info("Issue-resolution notice: %s", content)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -8168,6 +8382,11 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "issue":
+            return await self._handle_issue_command(event)
+        if canonical == "issue-next":
+            return await self._handle_issue_next_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -9563,6 +9782,10 @@ class GatewayRunner:
                         display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
                     else:
                         display_reasoning = last_reasoning.strip()
+                    display_reasoning = _sanitize_gateway_reasoning_for_display(
+                        source.platform,
+                        display_reasoning,
+                    )
                     response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
@@ -10459,6 +10682,51 @@ class GatewayRunner:
         ])
 
         return "\n".join(lines)
+
+    async def _handle_issue_command(self, event: MessageEvent) -> str:
+        """Handle /issue command by spawning the issue resolution lane."""
+        from gateway.issue_resolution import parse_issue_command_args, submit_issue_resolution
+
+        try:
+            request = parse_issue_command_args(event.get_command_args())
+        except ValueError as exc:
+            return f"Usage: /issue <owner/repo|issue-url> <number> [--workdir path]\nError: {exc}"
+
+        async def _notify(message: str) -> None:
+            await self._deliver_platform_notice(event.source, message)
+
+        try:
+            result = await submit_issue_resolution(request, notify=_notify)
+        except Exception as exc:
+            return f"Hermes: Issue #{request.issue_number} could not be queued: {exc}"
+        return (
+            f"Hermes: Issue #{request.issue_number} queued as run #{result.run_id}. "
+            "Local coder execution is single-flight."
+        )
+
+    async def _handle_issue_next_command(self, event: MessageEvent) -> str:
+        """Handle /issue-next by selecting the oldest open issue in a repo."""
+        from gateway.issue_resolution import (
+            parse_issue_next_command_args,
+            submit_next_issue_resolution,
+        )
+
+        try:
+            request = parse_issue_next_command_args(event.get_command_args())
+        except ValueError as exc:
+            return f"Usage: /issue-next <owner/repo> [--workdir path]\nError: {exc}"
+
+        async def _notify(message: str) -> None:
+            await self._deliver_platform_notice(event.source, message)
+
+        try:
+            result = await submit_next_issue_resolution(request, notify=_notify)
+        except Exception as exc:
+            return f"Hermes: Next open issue in {request.repo} could not be queued: {exc}"
+        return (
+            f"Hermes: Next open issue in {request.repo} queued as run #{result.run_id}. "
+            "Local coder execution is single-flight."
+        )
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
@@ -19575,11 +19843,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logger.debug("Takeover marker check failed: %s", e)
 
         # Planned stop check: service managers and `hermes gateway stop`
-        # also send SIGTERM, which is indistinguishable from an unexpected
-        # external kill unless the CLI marks it first. SIGINT comes from an
-        # interactive Ctrl+C and is likewise an intentional foreground stop.
+        # also send SIGTERM. A systemd-managed SIGTERM is a normal unit stop;
+        # CLI/manual stops use the marker path. SIGINT comes from an interactive
+        # Ctrl+C and is likewise an intentional foreground stop.
         planned_stop = False
         if received_signal == signal.SIGINT:
+            planned_stop = True
+        elif received_signal == signal.SIGTERM and os.environ.get("INVOCATION_ID"):
             planned_stop = True
         elif not planned_takeover:
             try:

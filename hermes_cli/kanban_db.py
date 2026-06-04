@@ -1321,6 +1321,16 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     # escape it. ``Path.resolve()`` collapses any ``..`` segments and
     # symlinks, and we only ever write inside ``parent``.
     resolved = path.resolve()
+    now = time.time()
+    key = str(resolved)
+    last = _LAST_CORRUPT_BACKUP.get(key)
+    # A corrupt board can be polled every few seconds by dashboard + gateway.
+    # Debounce backup creation so we preserve evidence once without creating an
+    # unbounded storm of near-identical .bak files and extra disk I/O.
+    if last is not None:
+        last_ts, last_reason, last_backup = last
+        if reason == last_reason and (now - last_ts) < _CORRUPT_BACKUP_WINDOW_SECONDS:
+            return last_backup
     parent = resolved.parent
     base_name = resolved.name  # basename only
     digest = hashlib.sha256()
@@ -1329,6 +1339,7 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
     except OSError:
+        _LAST_CORRUPT_BACKUP[key] = (now, reason, None)
         return None
     token = digest.hexdigest()[:16]
     candidate = parent / f"{base_name}.corrupt.{token}.bak"
@@ -1351,6 +1362,7 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             shutil.copy2(sidecar, sidecar_backup)
         except OSError:
             pass
+    _LAST_CORRUPT_BACKUP[key] = (now, reason, candidate)
     return candidate
 
 
@@ -1408,7 +1420,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
-    backup = _backup_corrupt_db(resolved)
+    backup = _backup_corrupt_db(resolved, reason)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
@@ -3014,22 +3026,41 @@ def claim_task(
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
         # holds (the common case).
+        #
+        # Also handle the case where current_run_id points to a run that has
+        # ended_at set but the task is still in 'ready' status — this can
+        # happen when a task is manually set to 'ready' (e.g. via CLI or
+        # dashboard) without clearing current_run_id.
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
-            conn.execute(
-                """
-                UPDATE task_runs
-                   SET status = 'reclaimed', outcome = 'reclaimed',
-                       summary = COALESCE(summary, 'invariant recovery on re-claim'),
-                       ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-                 WHERE id = ? AND ended_at IS NULL
-                """,
-                (now, int(stale["current_run_id"])),
-            )
+            # Check if the referenced run has already ended
+            ended_run = conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id = ? AND ended_at IS NOT NULL",
+                (int(stale["current_run_id"]),),
+            ).fetchone()
+            if ended_run:
+                # Run already ended — clear current_run_id so we don't
+                # try to end it again on completion.
+                conn.execute(
+                    "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+                    (task_id,),
+                )
+            else:
+                # Run is still in-flight but task is ready — reclaim it.
+                conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET status = 'reclaimed', outcome = 'reclaimed',
+                           summary = COALESCE(summary, 'invariant recovery on re-claim'),
+                           ended_at = ?,
+                           claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                     WHERE id = ? AND ended_at IS NULL
+                    """,
+                    (now, int(stale["current_run_id"])),
+                )
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4794,6 +4825,18 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MANAGED_DISPATCH_REPOS = {
+    "cryptotrader": {
+        "name": "CryptoTrader",
+        "protected_branches": ("master", "main"),
+        "allowed_dirty_prefixes": (
+            ".aider.chat.history.md",
+            ".aider.input.history",
+            ".aider.tags.cache.v4/",
+        ),
+    }
+}
+
 
 @dataclass
 class DispatchResult:
@@ -5900,6 +5943,67 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return None
 
 
+def check_managed_dispatch_guard(task: Task, *, board: Optional[str] = None) -> Optional[str]:
+    """Return a guard reason when a managed repo task must not auto-dispatch."""
+    board_slug = (board or get_current_board()).casefold()
+    policy = _MANAGED_DISPATCH_REPOS.get(board_slug)
+    if policy is None:
+        return None
+    if task.workspace_kind not in {"dir", "worktree"} or not task.workspace_path:
+        return None
+
+    workspace = Path(task.workspace_path).expanduser()
+    if not workspace.is_absolute():
+        return None
+
+    try:
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        status_output = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except Exception:
+        return None
+
+    protected_branches = tuple(str(value) for value in policy["protected_branches"])
+    if branch not in protected_branches:
+        return None
+
+    allowed_prefixes = tuple(str(value) for value in policy["allowed_dirty_prefixes"])
+    dirty_paths = [
+        _normalize_git_status_path(line) for line in status_output.splitlines() if line.strip()
+    ]
+    violating_paths = [
+        path for path in dirty_paths if not _is_allowed_managed_dirty_path(path, allowed_prefixes)
+    ]
+    if not violating_paths:
+        return None
+
+    return "managed_cryptotrader_protected_dirty"
+
+
+def _normalize_git_status_path(line: str) -> str:
+    """Extract the path portion from git status --porcelain output."""
+    raw = line[3:] if len(line) > 3 else line
+    if " -> " in raw:
+        raw = raw.split(" -> ", 1)[1]
+    return raw.strip()
+
+
+def _is_allowed_managed_dirty_path(path: str, prefixes: tuple[str, ...]) -> bool:
+    """Return true when a dirty path is allowed local tool noise."""
+    return any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in prefixes)
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -6203,6 +6307,20 @@ def dispatch_once(
                         {"reason": guard_reason},
                     )
             continue
+        task_for_guard = get_task(conn, row["id"])
+        if task_for_guard is not None:
+            managed_reason = check_managed_dispatch_guard(task_for_guard, board=board)
+            if managed_reason is not None:
+                result.managed_guarded.append((row["id"], managed_reason))
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn,
+                            row["id"],
+                            "managed_dispatch_guarded",
+                            {"reason": managed_reason},
+                        )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -7646,3 +7764,225 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Bak-file cleanup and database health
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MAX_BAK_FILES = 5
+_DEFAULT_VACUUM_INTERVAL_SECONDS = 3600  # 1 hour
+_DEFAULT_VACUUM_THRESHOLD_ROWS = 10000  # vacuum if more than this many rows
+
+
+def _find_bak_files(db_path: Path) -> list[Path]:
+    """Find all .bak files in the same directory as db_path.
+
+    Returns them sorted by modification time (oldest first).
+    Only considers files that are clearly kanban backups (contain
+    "corrupt" or "bak" in the name pattern).
+    """
+    # Look in the backups subdirectory if it exists, otherwise in the
+    # same directory as the DB file.
+    parent = db_path.parent
+    bak_dir = parent / "backups"
+    if bak_dir.is_dir():
+        search_dir = bak_dir
+    else:
+        search_dir = parent
+
+    bak_files = []
+    try:
+        for entry in search_dir.iterdir():
+            if entry.is_file() and entry.suffix == ".bak":
+                bak_files.append(entry)
+    except OSError:
+        pass
+    bak_files.sort(key=lambda p: p.stat().st_mtime)
+    return bak_files
+
+
+def cleanup_bak_files(
+    db_path: Optional[Path] = None,
+    *,
+    max_files: int = _DEFAULT_MAX_BAK_FILES,
+) -> dict:
+    """Prune old .bak files, keeping only the most recent ``max_files``.
+
+    Returns a dict with:
+      - ``deleted``: number of .bak files removed
+      - ``remaining``: number of .bak files left
+      - ``total_bytes_freed``: approximate bytes freed
+      - ``max_files``: the limit used
+
+    This breaks the corruption cycle by ensuring the backup directory
+    doesn't grow unbounded. The oldest .bak files are removed first.
+    """
+    if db_path is None:
+        db_path = kanban_db_path()
+    bak_files = _find_bak_files(db_path)
+    total = len(bak_files)
+    to_delete = bak_files[: max(total - max_files, 0)]
+    bytes_freed = 0
+    for bak in to_delete:
+        try:
+            bytes_freed += bak.stat().st_size
+            bak.unlink()
+        except OSError:
+            pass
+    remaining = total - len(to_delete)
+    return {
+        "deleted": len(to_delete),
+        "remaining": remaining,
+        "total_bytes_freed": bytes_freed,
+        "max_files": max_files,
+    }
+
+
+def vacuum_db(
+    db_path: Optional[Path] = None,
+    *,
+    min_rows: int = _DEFAULT_VACUUM_THRESHOLD_ROWS,
+) -> dict:
+    """Run VACUUM on the kanban DB if it meets the threshold.
+
+    VACUUM reclaims unused space from deleted/updated rows and
+    defragments the database file. It's a relatively expensive
+    operation, so we only run it when the DB has enough rows
+    to make it worthwhile.
+
+    Returns a dict with:
+      - ``vacuumed``: whether VACUUM was run
+      - ``before_bytes``: DB file size before VACUUM
+      - ``after_bytes``: DB file size after VACUUM
+      - ``rows``: number of rows in the tasks table
+    """
+    if db_path is None:
+        db_path = kanban_db_path()
+    before = db_path.stat().st_size
+    conn = sqlite3.connect(str(db_path.resolve()), timeout=30)
+    try:
+        row_count = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        if row_count < min_rows:
+            return {"vacuumed": False, "before_bytes": before, "after_bytes": before, "rows": row_count}
+        conn.execute("VACUUM")
+        after = db_path.stat().st_size
+        return {"vacuumed": True, "before_bytes": before, "after_bytes": after, "rows": row_count}
+    finally:
+        conn.close()
+
+
+def health_check(
+    db_path: Optional[Path] = None,
+    *,
+    max_bak_files: int = _DEFAULT_MAX_BAK_FILES,
+) -> dict:
+    """Run a comprehensive health check on the kanban DB.
+
+    Checks:
+      1. Database integrity (PRAGMA integrity_check)
+      2. WAL mode status
+      3. .bak file count (warns if above threshold)
+      4. Table row counts
+
+    Returns a dict with health status suitable for cron jobs.
+    """
+    if db_path is None:
+        db_path = kanban_db_path()
+    result = {
+        "healthy": True,
+        "db_path": str(db_path),
+        "db_size_bytes": db_path.stat().st_size,
+        "wal_mode": False,
+        "integrity_ok": False,
+        "bak_file_count": 0,
+        "bak_files_ok": True,
+        "tables": {},
+        "warnings": [],
+    }
+
+    # Check WAL mode
+    try:
+        probe = sqlite3.connect(str(db_path.resolve()), timeout=5)
+        mode_row = probe.execute("PRAGMA journal_mode").fetchone()
+        result["wal_mode"] = mode_row and mode_row[0] == "wal"
+        probe.close()
+    except Exception as exc:
+        result["warnings"].append(f"WAL check failed: {exc}")
+
+    # Check integrity
+    try:
+        _guard_existing_db_is_healthy(db_path)
+        result["integrity_ok"] = True
+    except KanbanDbCorruptError as exc:
+        result["integrity_ok"] = False
+        result["healthy"] = False
+        result["warnings"].append(f"Integrity check failed: {exc.reason}")
+    except Exception as exc:
+        result["warnings"].append(f"Integrity check warning: {exc}")
+
+    # Count .bak files
+    bak_files = _find_bak_files(db_path)
+    result["bak_file_count"] = len(bak_files)
+    if len(bak_files) > max_bak_files:
+        result["bak_files_ok"] = False
+        result["healthy"] = False
+        result["warnings"].append(
+            f"{len(bak_files)} .bak files exceed threshold of {max_bak_files}"
+        )
+
+    # Count rows per table
+    conn = sqlite3.connect(str(db_path.resolve()), timeout=30)
+    try:
+        for table in ["tasks", "task_events", "task_runs", "task_comments", "task_links"]:
+            try:
+                count = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                result["tables"][table] = count
+            except Exception:
+                result["tables"][table] = None
+    finally:
+        conn.close()
+
+    return result
+
+
+# Singleton tracking for periodic maintenance
+_last_vacuum_time: float = 0
+_last_cleanup_time: float = 0
+
+
+def periodic_maintenance(
+    db_path: Optional[Path] = None,
+    *,
+    max_bak_files: int = _DEFAULT_MAX_BAK_FILES,
+    vacuum_interval: int = _DEFAULT_VACUUM_INTERVAL_SECONDS,
+    vacuum_min_rows: int = _DEFAULT_VACUUM_THRESHOLD_ROWS,
+) -> dict:
+    """Run periodic maintenance: cleanup .bak files and VACUUM if needed.
+
+    This is the main entry point for cron jobs and the dispatcher.
+    It checks the last maintenance time and runs VACUUM only if
+    enough time has passed since the last run.
+
+    Returns a dict with all maintenance results.
+    """
+    global _last_vacuum_time, _last_cleanup_time
+    now = time.time()
+
+    result = {"maintenance_run": True}
+
+    # Cleanup .bak files every time (cheap operation)
+    result["bak_cleanup"] = cleanup_bak_files(db_path, max_files=max_bak_files)
+    _last_cleanup_time = now
+
+    # VACUUM only if interval has passed
+    if now - _last_vacuum_time > vacuum_interval:
+        result["vacuum"] = vacuum_db(db_path, min_rows=vacuum_min_rows)
+        _last_vacuum_time = now
+    else:
+        result["vacuum"] = {"vacuumed": False, "skipped": True}
+
+    # Run health check
+    result["health"] = health_check(db_path, max_bak_files=max_bak_files)
+
+    return result

@@ -1823,7 +1823,14 @@ def list_authenticated_providers(
             # set. The built-in row carries the curated model list, correct
             # auth wiring, and canonical slug — keep it and hide the shadow.
             _grp_url_norm = _pair_key[1]
-            if _grp_url_norm and _grp_url_norm in _builtin_endpoints:
+            is_current_custom_group = (
+                slug == current_provider
+                or (
+                    bool(current_base_url)
+                    and _grp_url_norm == current_base_url.strip().rstrip("/").lower()
+                )
+            )
+            if _grp_url_norm and _grp_url_norm in _builtin_endpoints and not is_current_custom_group:
                 continue
             # Live model discovery from custom provider endpoints (matches
             # Section 3 behavior for user ``providers:`` entries).
