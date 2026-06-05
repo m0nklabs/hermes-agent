@@ -6843,6 +6843,21 @@ def _default_spawn(
                 env["HERMES_MODEL"] = str(default_model)
         except Exception:
             pass
+    # HERMES_KANBAN_ISSUE_NUMBER — the numerical GitHub issue ID from the
+    # task body (e.g. "334"). Workers use this in ``Closes #334`` trailers
+    # instead of accidentally using the kanban task ID ``t_XXXXXXXX``.
+    # The task title/body format is: ``[GitHub OWNER/REPO #NNN] ...`` in the
+    # title, and ``Issue: #NNN - ...`` plus ``URL:
+    # https://github.com/OWNER/REPO/issues/NNN`` in the body.
+    import re as _re
+    _issue_match = _re.search(r"#(\d+)", task.title or "")
+    if _issue_match:
+        env["HERMES_KANBAN_ISSUE_NUMBER"] = _issue_match.group(1)
+    _issue_url_match = _re.search(
+        r"(https?://github\.com/[^/]+/[^/]+/issues/\d+)", task.body or ""
+    )
+    if _issue_url_match:
+        env["HERMES_KANBAN_ISSUE_URL"] = _issue_url_match.group(1)
 
     cmd = [
         *_resolve_hermes_argv(),
